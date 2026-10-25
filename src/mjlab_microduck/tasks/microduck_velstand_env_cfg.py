@@ -216,6 +216,7 @@ Phases (as before, but with a recovery backstop):
 """
 
 import math
+import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers import (
@@ -258,7 +259,12 @@ WARM_START_CHECKPOINT = "model_3750.pt"
 # Phase boundaries (PPO iterations; env step counter scales by num_steps_per_env=24).
 # Warm start: the walk exists at iter 0, so fell_over only needs a short
 # adaptation window to the all-collisions model before falls become data.
-FELL_OVER_DISABLE_ITER = 100 if WARM_START else 500
+FELL_OVER_DISABLE_ITER = 300 if WARM_START else 500
+# (pipeline review §1.6.3: gate on measurement. 275016 flipped it at 100 on a
+# run that still fell every ~2 s — the penalty returned while the walk was
+# nowhere near stable and the run slid into the velstand-ext lie-down. With
+# the actor freeze at 200, the penalty returns at 300 = freeze + 100 settle
+# iters, measured from actual policy movement.)
 
 # Fallen gates. LESSON (first rebase training run): the recovery REWARDS must
 # gate on TILT ONLY. Gating them on low height too made SITTING (z≈0.07, trunk
@@ -304,6 +310,13 @@ RECOVERY_ECON_KICKIN_ITER = 600 if WARM_START else 1200
 ENABLE_EXPERT_BC = True
 EXPERT_BC_COEF = 1.0
 EXPERT_BC_GATE_TILT_DEG = 35.0
+# baselduck patch (docs/upstream_patches.md): local teacher checkpoints via env
+# var, mirroring the MICRODUCK_WARM_START convention. The upstream W&B run ids
+# (69u48n8l / 441tzs6d) are private; Pollen publishes the same policies as ONNX,
+# which scripts/onnx_to_checkpoint.py converts to loadable checkpoints. Set
+# MICRODUCK_BC_EXPERT / MICRODUCK_BC_ANCHOR to the imported .pt paths.
+_EXPERT_LOCAL = os.environ.get("MICRODUCK_BC_EXPERT")
+_ANCHOR_LOCAL = os.environ.get("MICRODUCK_BC_ANCHOR")
 
 # Body control (2026-10, branch improve_velstand2). The deployed velstand ignores
 # body commands entirely (measured: 0 mm / 0° response — the inherited velocity
@@ -975,6 +988,7 @@ MicroduckVelStandRlCfg = RslRlOnPolicyRunnerCfg(
         obs_normalization=True,
     ),
     algorithm=PpoWithExpertBcCfg(
+        actor_freeze_iters=200 if WARM_START else 0,
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
@@ -990,6 +1004,8 @@ MicroduckVelStandRlCfg = RslRlOnPolicyRunnerCfg(
         symmetry_cfg=None,
         bc_cfg={
             **default_bc_cfg(), "coef": EXPERT_BC_COEF, "gate_tilt_deg": EXPERT_BC_GATE_TILT_DEG,
+            **({"checkpoint_path": _EXPERT_LOCAL} if _EXPERT_LOCAL else {}),
+            **({"anchor_checkpoint_path": _ANCHOR_LOCAL} if _ANCHOR_LOCAL else {}),
             **({"body_slice": (55, 61)} if ENABLE_BODY_CONTROL else {}),
             **({"unanchor_turn_in_place": True} if ENABLE_YAW_FIX else {}),
             **({"anchor_yaw_remap": ANCHOR_YAW_REMAP} if ENABLE_ANCHOR_YAW_REMAP else {}),

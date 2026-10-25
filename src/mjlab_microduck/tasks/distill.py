@@ -123,9 +123,17 @@ def default_bc_cfg() -> dict:
 
 @dataclass
 class PpoWithExpertBcCfg(PpoWithSymmetryCfg):
-    """PpoWithSymmetryCfg + fallen-gated expert behavior cloning."""
+    """PpoWithSymmetryCfg + fallen-gated expert behavior cloning.
+
+    actor_freeze_iters: critic warm-up for warm-started PPO (pipeline review
+    2026-10-25 §1.6.4). The actor arrives trained (imported product policy)
+    while the critic is fresh random noise; naive joint PPO drives the actor
+    off-envelope before the value baseline settles (275016: iter-0 reward
+    -9.71 → -24, ep_len 104 → 78). Freezing the actor for N iterations lets
+    the critic learn the frozen policy's values first. 0 = off."""
 
     bc_cfg: dict | None = field(default_factory=default_bc_cfg)
+    actor_freeze_iters: int = 0
     class_name: str = "mjlab_microduck.tasks.distill.PpoWithExpertBc"
 
 
@@ -240,11 +248,29 @@ def _resolve_checkpoint(bc_cfg: dict, prefix: str = "") -> Path | None:
 
 
 class PpoWithExpertBc(PPO):
-    def __init__(self, actor, critic, storage, *args, bc_cfg: dict | None = None, **kwargs) -> None:
+    def __init__(self, actor, critic, storage, *args, bc_cfg: dict | None = None,
+                 actor_freeze_iters: int = 0, **kwargs) -> None:
         super().__init__(actor, critic, storage, *args, **kwargs)
         self.bc_cfg = bc_cfg
         self.expert = None
         self.anchor = None
+        # ── critic warm-up: actor freeze (pipeline review §1.6.4) ─────────
+        # rsl_rl's update() takes no iteration argument, so count update()
+        # calls ourselves. The freeze is restore-based (robust to PPO's
+        # adaptive-KL lr changes AND to the BC optimizer both touching the
+        # actor): after each update while frozen, the actor's exact entry
+        # state is restored. Covers mlp, distribution std and normalizer.
+        self._freeze_total = int(actor_freeze_iters)
+        self._freeze_done = 0
+        self._frozen_actor_sd = None
+        if self._freeze_total > 0:
+            with torch.no_grad():
+                self._frozen_actor_sd = {
+                    k: v.detach().clone()
+                    for k, v in self.actor.state_dict().items()}
+            print(f"[distill] critic warm-up: actor FROZEN for "
+                  f"{self._freeze_total} iters (critic catches up first)",
+                  flush=True)
         if bc_cfg:
             ckpt = torch.load(_resolve_checkpoint(bc_cfg), map_location=self.device, weights_only=False)
             self.expert = load_expert_from(self.actor, ckpt["actor_state_dict"]).to(self.device)
@@ -334,7 +360,35 @@ class PpoWithExpertBc(PPO):
         return stats
 
     def update(self) -> dict[str, float]:
+        frozen = self._freeze_total > 0 and self._freeze_done < self._freeze_total
+        if frozen:
+            # skip the BC pass too: it only moves the actor, which is frozen
+            loss_dict = super().update()
+            self._restore_frozen_actor()
+            self._freeze_done += 1
+            if self._freeze_done == self._freeze_total:
+                print(f"[distill] actor freeze over "
+                      f"({self._freeze_total} iters) — actor now trains",
+                      flush=True)
+            return loss_dict
         loss_dict = super().update()
         if self.expert is not None:
             loss_dict.update(self._bc_update())
         return loss_dict
+
+    def _restore_frozen_actor(self) -> None:
+        """Restore the snapshot without load_state_dict: some buffers (e.g.
+        EmpiricalNormalization._std, reassigned as ``torch.sqrt(self._var)``
+        inside the runner's inference_mode rollout) are inference tensors,
+        and an in-place write to them is only legal INSIDE inference_mode.
+        Params (requires_grad) are the opposite. Handle each tensor in its
+        legal mode. Job 275077 crashed exactly here with load_state_dict."""
+        with torch.no_grad():
+            live = dict(self.actor.state_dict())
+            for key, snap in self._frozen_actor_sd.items():
+                dst = live[key]
+                if dst.is_inference():
+                    with torch.inference_mode():
+                        dst.copy_(snap)
+                else:
+                    dst.copy_(snap)
