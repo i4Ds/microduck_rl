@@ -645,7 +645,9 @@ def make_microduck_velocity_env_cfg(
     # lin ±0.4 / ang ±2.0 outpaced the robot's capability and tracked a
     # post-iter-1000 reward/episode-length decline. ang ±1.0 is the big
     # change — it makes turning learnable.
-    command.ranges.lin_vel_x = (-0.4, 0.4)
+    # baselduck patch 0003 (phase 4a speed): lin ±0.4 → ±0.8. ang/lin_y kept:
+    # only forward speed widens; from-scratch single-seed sanity run first.
+    command.ranges.lin_vel_x = (-0.8, 0.8)
     command.ranges.lin_vel_y = (-0.3, 0.3)
     command.ranges.ang_vel_z = (-1.0, 1.0)
     command.viz.z_offset = 0.5
