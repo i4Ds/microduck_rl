@@ -341,6 +341,12 @@ BODY_ZERO_CMD_PROB = 0.3
 BODY_Z_ZERO_PROB = 0.5             # share of body commands that are tilt-only (→ teachable)
 BODY_TRACK_WEIGHT = 2.0
 BODY_RANGE_STAGES_ITERS = (0, 300)  # half range → full range (warm start: iters of THIS run)
+# Strategy review 2026-10-26 §2: velstand.onnx's body-angle normaliser std is
+# 0.042 rad (trained range ≈ ±4°); commanding 6–12° from iteration 0 perturbs
+# the import more than a walking command does (max |Δaction| 0.51–0.73 rad vs
+# 0.36 for vx=0.3). Warm start: hold body commands at ZERO through the actor
+# freeze (200 iters, matches actor_freeze_iters), then ramp half → full.
+BODY_WARM_HOLD_ZERO = WARM_START
 # Leg pose stds while a body command is active (standing). The standing stds (hip_roll
 # 0.05, knee/hip_pitch 0.15, ankle 0.1) priced a 10° commanded roll at -0.85/step.
 BODY_POSE_STD = {
@@ -563,7 +569,8 @@ def _add_body_control(cfg: ManagerBasedRlEnvCfg, play: bool) -> None:
     old = cfg.commands["body_pose"]
     cfg.commands["body_pose"] = microduck_mdp.StandingGatedPoseCommandCfg(
         resampling_time_range=old.resampling_time_range,
-        ranges=_body_ranges(1.0 if play else 0.5),
+        ranges=_body_ranges(1.0 if play
+                            else (0.0 if BODY_WARM_HOLD_ZERO else 0.5)),
         zero_command_prob=BODY_ZERO_CMD_PROB,
         axis_zero_prob=(0.0, 0.0, BODY_Z_ZERO_PROB, 0.0, 0.0, 0.0),
         twist_command_name="twist",
@@ -571,13 +578,15 @@ def _add_body_control(cfg: ManagerBasedRlEnvCfg, play: bool) -> None:
     assert list(cfg.commands).index("twist") < list(cfg.commands).index("body_pose"), "twist must be computed first"
     cfg.curriculum.pop("body_pose_range", None)
     if not play:
+        stages = ([(0, 0.0)] if BODY_WARM_HOLD_ZERO else []) + [
+            (it, f) for it, f in zip(BODY_RANGE_STAGES_ITERS, (0.5, 1.0))]
         cfg.curriculum["body_pose_range"] = CurriculumTermCfg(
             func=microduck_mdp.pose_command_range_curriculum,
             params={
                 "command_name": "body_pose",
                 "range_stages": [
                     {"step": it * NUM_STEPS_PER_ENV, "ranges": _body_ranges(f)}
-                    for it, f in zip(BODY_RANGE_STAGES_ITERS, (0.5, 1.0))
+                    for it, f in stages
                 ],
             },
         )

@@ -262,14 +262,19 @@ class PpoWithExpertBc(PPO):
         # state is restored. Covers mlp, distribution std and normalizer.
         self._freeze_total = int(actor_freeze_iters)
         self._freeze_done = 0
+        # LAZY snapshot (strategy review 2026-10-26 §2): the runner loads the
+        # imported checkpoint AFTER the algorithm is constructed, so an
+        # __init__ snapshot here captures the RANDOM init — and the first
+        # update() then restored it every iter: attempts 275084/275094/275123
+        # unknowingly trained from scratch (std 1.0, ep_len 31 at iter 1).
+        # The snapshot is therefore taken at the first frozen update(),
+        # i.e. after runner.load(). Working rule (plan §7.6): a warm-started
+        # job must reproduce the import's behaviour at iteration 1 or die.
         self._frozen_actor_sd = None
         if self._freeze_total > 0:
-            with torch.no_grad():
-                self._frozen_actor_sd = {
-                    k: v.detach().clone()
-                    for k, v in self.actor.state_dict().items()}
             print(f"[distill] critic warm-up: actor FROZEN for "
-                  f"{self._freeze_total} iters (critic catches up first)",
+                  f"{self._freeze_total} iters (critic catches up first; "
+                  f"entry snapshot taken at the first update, after load)",
                   flush=True)
         if bc_cfg:
             ckpt = torch.load(_resolve_checkpoint(bc_cfg), map_location=self.device, weights_only=False)
@@ -362,6 +367,15 @@ class PpoWithExpertBc(PPO):
     def update(self) -> dict[str, float]:
         frozen = self._freeze_total > 0 and self._freeze_done < self._freeze_total
         if frozen:
+            if self._frozen_actor_sd is None:
+                # first frozen update: runner.load() has restored the import
+                # by now — snapshot the ACTUAL entry state to restore each iter
+                with torch.no_grad():
+                    self._frozen_actor_sd = {
+                        k: v.detach().clone()
+                        for k, v in self.actor.state_dict().items()}
+                print("[distill] frozen-actor entry snapshot taken (post-load)",
+                      flush=True)
             # skip the BC pass too: it only moves the actor, which is frozen
             loss_dict = super().update()
             self._restore_frozen_actor()
